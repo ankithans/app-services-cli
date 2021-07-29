@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	flagutil "github.com/redhat-developer/app-services-cli/pkg/cmdutil/flags"
 	"github.com/redhat-developer/app-services-cli/pkg/connection"
 	"github.com/redhat-developer/app-services-cli/pkg/iostreams"
 	"github.com/redhat-developer/app-services-cli/pkg/localize"
-	srsmgmtv1 "github.com/redhat-developer/app-services-sdk-go/registrymgmt/apiv1/client"
+	registryinstanceclient "github.com/redhat-developer/app-services-sdk-go/registryinstance/apiv1internal/client"
 
 	"github.com/redhat-developer/app-services-cli/pkg/dump"
 
@@ -18,24 +19,37 @@ import (
 	"github.com/redhat-developer/app-services-cli/internal/config"
 	"github.com/redhat-developer/app-services-cli/pkg/cmd/factory"
 	"github.com/redhat-developer/app-services-cli/pkg/cmd/flag"
+	"github.com/redhat-developer/app-services-cli/pkg/cmd/registry/artifacts/util"
 	"github.com/redhat-developer/app-services-cli/pkg/logging"
 
 	"gopkg.in/yaml.v2"
 )
 
 // row is the details of a Service Registry instance needed to print to a table
-type RegistryRow struct {
-	ID     string `json:"id" header:"ID"`
-	Name   string `json:"name" header:"Name"`
-	Owner  string `json:"owner" header:"Owner"`
-	Status string `json:"status" header:"Status"`
+type ArtifactRow struct {
+	// The ID of a single artifact.
+	Id string `json:"id" header:"ID"`
+
+	Name *string `json:"name,omitempty" header:"Name"`
+
+	CreatedOn time.Time `json:"createdOn" header:"Created"`
+
+	CreatedBy string `json:"createdBy" header:"Created By"`
+
+	Type registryinstanceclient.ArtifactType `json:"type" header:"Type"`
+
+	State registryinstanceclient.ArtifactState `json:"state" header:"State"`
 }
 
-type options struct {
+type Options struct {
+	group string
+
+	registryID   string
 	outputFormat string
-	page         int32
-	limit        int32
-	search       string
+	orderBy      string
+
+	page  int32
+	limit int32
 
 	IO         *iostreams.IOStreams
 	Config     config.IConfig
@@ -46,7 +60,7 @@ type options struct {
 
 // NewListCommand creates a new command for listing service registries.
 func NewListCommand(f *factory.Factory) *cobra.Command {
-	opts := &options{
+	opts := &Options{
 		Config:     f.Config,
 		Connection: f.Connection,
 		Logger:     f.Logger,
@@ -56,59 +70,86 @@ func NewListCommand(f *factory.Factory) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:     "list",
-		Short:   "List artifact",
-		Long:    "",
+		Short:   "List artifacts",
+		Long:    "List all artifacts for the group",
 		Example: "",
-		Args:    cobra.NoArgs,
+		Args:    cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.outputFormat != "" && !flagutil.IsValidInput(opts.outputFormat, flagutil.ValidOutputFormats...) {
 				return flag.InvalidValueError("output", opts.outputFormat, flagutil.ValidOutputFormats...)
 			}
 
+			if len(args) > 0 {
+				opts.group = args[0]
+			}
+
+			if opts.registryID != "" {
+				return runList(opts)
+			}
+
+			cfg, err := opts.Config.Load()
+			if err != nil {
+				return err
+			}
+
+			if !cfg.HasServiceRegistry() {
+				return fmt.Errorf("No service Registry selected. Use rhoas registry use to select your registry")
+			}
+
+			opts.registryID = fmt.Sprint(cfg.Services.ServiceRegistry.InstanceID)
+
 			return runList(opts)
 		},
 	}
 
-	cmd.Flags().StringVarP(&opts.outputFormat, "output", "o", "", opts.localizer.MustLocalize("registry.cmd.flag.output.description"))
-	cmd.Flags().Int32VarP(&opts.page, "page", "", 1, opts.localizer.MustLocalize("registry.list.flag.page"))
-	cmd.Flags().Int32VarP(&opts.limit, "limit", "", 100, opts.localizer.MustLocalize("registry.list.flag.limit"))
-	cmd.Flags().StringVarP(&opts.search, "search", "", "", opts.localizer.MustLocalize("registry.list.flag.search"))
+	cmd.Flags().StringVarP(&opts.group, "group", "g", "", "Artifact group")
+
+	cmd.Flags().Int32VarP(&opts.page, "page", "", 1, "Page number")
+	cmd.Flags().Int32VarP(&opts.limit, "limit", "", 100, "Page limit")
+	cmd.Flags().StringVarP(&opts.orderBy, "orderBy", "", "", "Order by fields (id, name, owner etc.) ")
+
+	cmd.Flags().StringVarP(&opts.registryID, "registryId", "", "", "Id of the registry to be used. By default uses currently selected registry.")
+	cmd.Flags().StringVarP(&opts.outputFormat, "output", "o", "", "Output type")
 
 	flagutil.EnableOutputFlagCompletion(cmd)
 
 	return cmd
 }
 
-func runList(opts *options) error {
+func runList(opts *Options) error {
 	logger, err := opts.Logger()
 	if err != nil {
 		return err
 	}
 
-	connection, err := opts.Connection(connection.DefaultConfigSkipMasAuth)
+	if opts.group == "" {
+		logger.Info("Group was not specified. Using 'default' artifacts group.")
+		opts.group = util.DefaultArtifactGroup
+	}
+
+	connection, err := opts.Connection(connection.DefaultConfigRequireMasAuth)
 	if err != nil {
 		return err
 	}
 
 	api := connection.API()
 
-	a := api.ServiceRegistryMgmt().GetRegistries(context.Background())
-	a = a.Page(opts.page)
-	a = a.Size(opts.limit)
-
-	if opts.search != "" {
-		query := buildQuery(opts.search)
-		logger.Debug("Filtering Service Registries with query", query)
-		a = a.Search(query)
-	}
-
-	response, _, err := a.Execute()
+	a, _, err := api.ServiceRegistryInstance(opts.registryID)
 	if err != nil {
 		return err
 	}
+	request := a.ArtifactsApi.ListArtifactsInGroup(context.Background(), opts.group)
+	request = request.Offset(opts.page)
+	request = request.Limit(opts.limit)
 
-	if len(response.Items) == 0 && opts.outputFormat == "" {
-		logger.Info(opts.localizer.MustLocalize("registry.common.log.info.noInstances"))
+	response, data, err := request.Execute()
+	if err != nil {
+		logger.Info(data, err)
+		return err
+	}
+
+	if len(response.Artifacts) == 0 && opts.outputFormat == "" {
+		logger.Info("No artifacts available for this group and registry instance")
 		return nil
 	}
 
@@ -120,7 +161,7 @@ func runList(opts *options) error {
 		data, _ := yaml.Marshal(response)
 		_ = dump.YAML(opts.IO.Out, data)
 	default:
-		rows := mapResponseItemsToRows(&response.Items)
+		rows := mapResponseItemsToRows(&response.Artifacts)
 		dump.Table(opts.IO.Out, rows)
 		logger.Info("")
 	}
@@ -128,29 +169,22 @@ func runList(opts *options) error {
 	return nil
 }
 
-func mapResponseItemsToRows(registries *[]srsmgmtv1.RegistryRest) []RegistryRow {
-	rows := []RegistryRow{}
+func mapResponseItemsToRows(artifacts *[]registryinstanceclient.SearchedArtifact) []ArtifactRow {
+	rows := []ArtifactRow{}
 
-	for i := range *registries {
-		k := (*registries)[i]
-		row := RegistryRow{
-			ID:     fmt.Sprint(k.Id),
-			Name:   k.GetName(),
-			Status: string(k.GetStatus()),
-			Owner:  k.GetOwner(),
+	for i := range *artifacts {
+		k := (*artifacts)[i]
+		row := ArtifactRow{
+			Id:        k.GetId(),
+			Name:      k.Name,
+			CreatedOn: k.GetCreatedOn(),
+			CreatedBy: k.GetCreatedBy(),
+			Type:      k.GetType(),
+			State:     k.GetState(),
 		}
 
 		rows = append(rows, row)
 	}
 
 	return rows
-}
-
-func buildQuery(search string) string {
-	queryString := fmt.Sprintf(
-		"name=%v",
-		search,
-	)
-
-	return queryString
 }

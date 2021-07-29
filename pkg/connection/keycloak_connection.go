@@ -9,13 +9,17 @@ import (
 	"net/url"
 
 	kafkainstance "github.com/redhat-developer/app-services-sdk-go/kafkainstance/apiv1internal"
+	kafkainstanceclient "github.com/redhat-developer/app-services-sdk-go/kafkainstance/apiv1internal/client"
+
 	kafkamgmt "github.com/redhat-developer/app-services-sdk-go/kafkamgmt/apiv1"
 	kafkamgmtclient "github.com/redhat-developer/app-services-sdk-go/kafkamgmt/apiv1/client"
+
 	registryinstance "github.com/redhat-developer/app-services-sdk-go/registryinstance/apiv1internal"
-	kafkainstanceclient "github.com/redhat-developer/app-services-sdk-go/registryinstance/apiv1internal/client"
 	registryinstanceclient "github.com/redhat-developer/app-services-sdk-go/registryinstance/apiv1internal/client"
+
 	registrymgmt "github.com/redhat-developer/app-services-sdk-go/registrymgmt/apiv1"
 	registrymgmtclient "github.com/redhat-developer/app-services-sdk-go/registrymgmt/apiv1/client"
+
 	"golang.org/x/oauth2"
 
 	"github.com/redhat-developer/app-services-cli/pkg/api/ams/amsclient"
@@ -327,7 +331,7 @@ func (c *KeycloakConnection) createKafkaAdminAPI(bootstrapURL string) *kafkainst
 	return client
 }
 
-// Create a new KafkaAdmin API client
+// Create a new RegistryInstance API client
 func (c *KeycloakConnection) createServiceRegistryInstanceAPI(registryUrl string) *registryinstanceclient.APIClient {
 	host, port, _ := net.SplitHostPort(registryUrl)
 
@@ -341,7 +345,7 @@ func (c *KeycloakConnection) createServiceRegistryInstanceAPI(registryUrl string
 		apiURL.Path = "/data/registry"
 		baseURL = apiURL.String()
 	} else {
-		baseURL = registryUrl
+		baseURL = registryUrl + "/apis/registry/v2"
 	}
 
 	c.logger.Debugf("Making request to %v", baseURL)
