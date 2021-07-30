@@ -106,7 +106,7 @@ func NewListCommand(f *factory.Factory) *cobra.Command {
 
 	cmd.Flags().Int32VarP(&opts.page, "page", "", 1, "Page number")
 	cmd.Flags().Int32VarP(&opts.limit, "limit", "", 100, "Page limit")
-	cmd.Flags().StringVarP(&opts.orderBy, "orderBy", "", "", "Order by fields (id, name, owner etc.) ")
+	cmd.Flags().StringVarP(&opts.orderBy, "orderBy", "", "", "Order by fields (id, name etc.) ")
 
 	cmd.Flags().StringVarP(&opts.registryID, "registryId", "", "", "Id of the registry to be used. By default uses currently selected registry.")
 	cmd.Flags().StringVarP(&opts.outputFormat, "output", "o", "", "Output type")

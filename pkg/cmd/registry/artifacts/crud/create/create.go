@@ -83,7 +83,7 @@ func NewCreateCommand(f *factory.Factory) *cobra.Command {
 			// TODO validate artifact types
 
 			if !cfg.HasServiceRegistry() {
-				return fmt.Errorf("No service Registry selected. Use rhoas registry use to select your registry")
+				return fmt.Errorf("No service Registry selected. Use 'rhoas service-registry use' use to select your registry")
 			}
 
 			opts.registryID = fmt.Sprint(cfg.Services.ServiceRegistry.InstanceID)
@@ -97,7 +97,6 @@ func NewCreateCommand(f *factory.Factory) *cobra.Command {
 	cmd.Flags().StringVarP(&opts.artifact, "artifact", "a", "", "Id of the artifact")
 	cmd.Flags().StringVarP(&opts.group, "group", "g", "", "Id of the artifact")
 	cmd.Flags().StringVarP(&opts.artifactType, "type", "t", "", "Type of artifact")
-	cmd.Flags().StringVarP(&opts.version, "version", "", "", "Force specific version of the artifact")
 	cmd.Flags().StringVarP(&opts.registryID, "registryId", "", "", "Id of the registry to be used. By default uses currently selected registry.")
 
 	flagutil.EnableOutputFlagCompletion(cmd)

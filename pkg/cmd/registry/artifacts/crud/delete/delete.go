@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 
+	flagutil "github.com/redhat-developer/app-services-cli/pkg/cmdutil/flags"
+
 	"github.com/redhat-developer/app-services-cli/pkg/connection"
 	"github.com/redhat-developer/app-services-cli/pkg/localize"
-	"github.com/redhat-developer/app-services-cli/pkg/serviceregistry"
 
 	"github.com/redhat-developer/app-services-cli/pkg/iostreams"
+	"github.com/redhat-developer/app-services-cli/pkg/serviceregistry/registryinstanceerror"
 
 	"github.com/redhat-developer/app-services-cli/pkg/logging"
 
@@ -17,15 +19,18 @@ import (
 	"github.com/redhat-developer/app-services-cli/internal/config"
 	"github.com/redhat-developer/app-services-cli/pkg/cmd/factory"
 	"github.com/redhat-developer/app-services-cli/pkg/cmd/flag"
+	"github.com/redhat-developer/app-services-cli/pkg/cmd/registry/artifacts/util"
 	"github.com/spf13/cobra"
-
-	srsmgmtv1client "github.com/redhat-developer/app-services-sdk-go/registrymgmt/apiv1/client"
 )
 
-type options struct {
-	id    string
-	name  string
-	force bool
+type Options struct {
+	artifact string
+	group    string
+
+	registryID string
+
+	outputFormat string
+	force        bool
 
 	IO         *iostreams.IOStreams
 	Config     config.IConfig
@@ -35,7 +40,7 @@ type options struct {
 }
 
 func NewDeleteCommand(f *factory.Factory) *cobra.Command {
-	opts := &options{
+	opts := &Options{
 		Config:     f.Config,
 		Connection: f.Connection,
 		Logger:     f.Logger,
@@ -54,15 +59,16 @@ func NewDeleteCommand(f *factory.Factory) *cobra.Command {
 				return flag.RequiredWhenNonInteractiveError("yes")
 			}
 
+			validOutputFormats := flagutil.ValidOutputFormats
+			if opts.outputFormat != "" && !flagutil.IsValidInput(opts.outputFormat, validOutputFormats...) {
+				return flag.InvalidValueError("output", opts.outputFormat, validOutputFormats...)
+			}
+
 			if len(args) > 0 {
-				opts.name = args[0]
+				opts.artifact = args[0]
 			}
 
-			if opts.name != "" && opts.id != "" {
-				return errors.New(opts.localizer.MustLocalize("service.error.idAndNameCannotBeUsed"))
-			}
-
-			if opts.id != "" || opts.name != "" {
+			if opts.registryID != "" {
 				return runDelete(opts)
 			}
 
@@ -71,100 +77,92 @@ func NewDeleteCommand(f *factory.Factory) *cobra.Command {
 				return err
 			}
 
-			var serviceRegistryConfig *config.ServiceRegistryConfig
-			if cfg.Services.ServiceRegistry == serviceRegistryConfig || cfg.Services.ServiceRegistry.InstanceID == "" {
-				return errors.New(opts.localizer.MustLocalize("registry.common.error.noServiceSelected"))
+			if !cfg.HasServiceRegistry() {
+				return fmt.Errorf("No service Registry selected. Use 'rhoas service-registry use' use to select your registry")
 			}
 
-			opts.id = fmt.Sprint(cfg.Services.ServiceRegistry.InstanceID)
-
+			opts.registryID = fmt.Sprint(cfg.Services.ServiceRegistry.InstanceID)
 			return runDelete(opts)
 		},
 	}
 
-	cmd.Flags().StringVar(&opts.id, "id", "", opts.localizer.MustLocalize("registry.common.flag.id"))
-	cmd.Flags().BoolVarP(&opts.force, "yes", "y", false, opts.localizer.MustLocalize("registry.common.flag.yes"))
+	cmd.Flags().BoolVarP(&opts.force, "yes", "y", false, "Delete without prompt")
+	cmd.Flags().StringVarP(&opts.outputFormat, "output", "o", "json", opts.localizer.MustLocalize("registry.cmd.flag.output.description"))
+
+	cmd.Flags().StringVarP(&opts.artifact, "artifact", "a", "", "Id of the artifact")
+	cmd.Flags().StringVarP(&opts.group, "group", "g", "", "Id of the artifact")
+	cmd.Flags().StringVarP(&opts.registryID, "registryId", "", "", "Id of the registry to be used. By default uses currently selected registry.")
 
 	return cmd
 }
 
-func runDelete(opts *options) error {
+func runDelete(opts *Options) error {
 	logger, err := opts.Logger()
 	if err != nil {
 		return err
 	}
 
-	cfg, err := opts.Config.Load()
+	conn, err := opts.Connection(connection.DefaultConfigRequireMasAuth)
 	if err != nil {
 		return err
 	}
 
-	connection, err := opts.Connection(connection.DefaultConfigSkipMasAuth)
+	dataAPI, _, err := conn.API().ServiceRegistryInstance(opts.registryID)
 	if err != nil {
 		return err
 	}
 
-	api := connection.API()
-
-	var registry *srsmgmtv1client.RegistryRest
-	ctx := context.Background()
-	if opts.name != "" {
-		registry, _, err = serviceregistry.GetServiceRegistryByName(ctx, api.ServiceRegistryMgmt(), opts.name)
-		if err != nil {
-			return err
-		}
-	} else {
-		registry, _, err = serviceregistry.GetServiceRegistryByID(ctx, api.ServiceRegistryMgmt(), opts.id)
-		if err != nil {
-			return err
-		}
+	if opts.group == "" {
+		logger.Info("Group was not specified. Using 'default' artifacts group.")
+		opts.group = util.DefaultArtifactGroup
 	}
 
-	registryName := registry.GetName()
-	logger.Info(opts.localizer.MustLocalize("registry.delete.log.info.deletingService", localize.NewEntry("Name", registryName)))
-	logger.Info("")
-
-	if !opts.force {
-		promptConfirmName := &survey.Input{
-			Message: opts.localizer.MustLocalize("registry.delete.input.confirmName.message"),
-		}
-
-		var confirmedName string
-		err = survey.AskOne(promptConfirmName, &confirmedName)
+	if opts.artifact == "" {
+		logger.Info("Artifact was not specified. Command will delete all artifacts in the group")
+		err = confirmDelete(opts, "Do you want to delete ALL ARTIFACTS from group "+opts.group)
 		if err != nil {
-			return err
-		}
-
-		if confirmedName != registryName {
-			logger.Info(opts.localizer.MustLocalize("registry.delete.log.info.incorrectNameConfirmation"))
 			return nil
 		}
+		ctx := context.Background()
+		request := dataAPI.ArtifactsApi.DeleteArtifactsInGroup(ctx, opts.group)
+		_, err = request.Execute()
+		if err != nil {
+			return registryinstanceerror.TransformError(err)
+		}
+		logger.Info("Artifacts in group" + opts.group + "deleted: ")
+	} else {
+		logger.Info("Deleting artifact " + opts.artifact)
+		err = confirmDelete(opts, "Do you want to delete artifact "+opts.artifact+" from group "+opts.group)
+		if err != nil {
+			return nil
+		}
+		ctx := context.Background()
+		request := dataAPI.ArtifactsApi.DeleteArtifact(ctx, opts.group, opts.artifact)
+
+		_, err := request.Execute()
+		if err != nil {
+			return registryinstanceerror.TransformError(err)
+		}
+		logger.Info("Artifact deleted: " + opts.artifact)
 	}
 
-	logger.Debug("Deleting Service registry", fmt.Sprintf("\"%s\"", registryName))
+	return nil
+}
 
-	a := api.ServiceRegistryMgmt().DeleteRegistry(context.Background(), registry.GetId())
-	_, err = a.Execute()
+func confirmDelete(opts *Options, message string) error {
+	if !opts.force {
+		var shouldContinue bool
+		confirm := &survey.Confirm{
+			Message: message,
+		}
+		err := survey.AskOne(confirm, &shouldContinue)
+		if err != nil {
+			return err
+		}
 
-	if err != nil {
-		return err
+		if !shouldContinue {
+			return errors.New("")
+		}
 	}
-
-	logger.Info(opts.localizer.MustLocalize("registry.delete.log.info.deleteSuccess", localize.NewEntry("Name", registryName)))
-
-	currentContextRegistry := cfg.Services.ServiceRegistry
-	// this is not the current cluster, our work here is done
-	if currentContextRegistry == nil || currentContextRegistry.InstanceID != opts.id {
-		return nil
-	}
-
-	// the service that was deleted is set as the user's current cluster
-	// since it was deleted it should be removed from the config
-	cfg.Services.ServiceRegistry = nil
-	err = opts.Config.Save(cfg)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }

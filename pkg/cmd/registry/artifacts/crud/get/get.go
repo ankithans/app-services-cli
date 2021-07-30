@@ -2,33 +2,34 @@ package get
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"io"
+	"fmt"
+	"os"
 
 	flagutil "github.com/redhat-developer/app-services-cli/pkg/cmdutil/flags"
 	"github.com/redhat-developer/app-services-cli/pkg/connection"
 	"github.com/redhat-developer/app-services-cli/pkg/iostreams"
 	"github.com/redhat-developer/app-services-cli/pkg/localize"
-	"github.com/redhat-developer/app-services-cli/pkg/serviceregistry"
-
-	"github.com/redhat-developer/app-services-cli/pkg/cmd/flag"
+	"github.com/redhat-developer/app-services-cli/pkg/serviceregistry/registryinstanceerror"
+	"github.com/spf13/cobra"
 
 	"github.com/redhat-developer/app-services-cli/internal/config"
 	"github.com/redhat-developer/app-services-cli/pkg/cmd/factory"
-	"github.com/redhat-developer/app-services-cli/pkg/dump"
-	srsmgmtv1 "github.com/redhat-developer/app-services-sdk-go/registrymgmt/apiv1/client"
-	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v2"
+	"github.com/redhat-developer/app-services-cli/pkg/cmd/registry/artifacts/util"
+
+	"github.com/redhat-developer/app-services-cli/pkg/logging"
 )
 
 type Options struct {
-	id           string
-	name         string
-	outputFormat string
+	artifact string
+	group    string
+
+	version string
+
+	registryID string
 
 	IO         *iostreams.IOStreams
 	Config     config.IConfig
+	Logger     func() (logging.Logger, error)
 	Connection factory.ConnectionFunc
 	localizer  localize.Localizer
 }
@@ -41,30 +42,26 @@ func NewGetCommand(f *factory.Factory) *cobra.Command {
 		Connection: f.Connection,
 		IO:         f.IOStreams,
 		localizer:  f.Localizer,
+		Logger:     f.Logger,
 	}
 
 	cmd := &cobra.Command{
 		Use:     "get",
-		Short:   "get artifact",
+		Short:   "Get latest artifact by id and group",
 		Long:    "",
 		Example: "",
 		Args:    cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			validOutputFormats := flagutil.ValidOutputFormats
-			if opts.outputFormat != "" && !flagutil.IsValidInput(opts.outputFormat, validOutputFormats...) {
-				return flag.InvalidValueError("output", opts.outputFormat, validOutputFormats...)
+			if len(args) > 0 {
+				opts.artifact = args[0]
 			}
 
 			if len(args) > 0 {
-				opts.name = args[0]
+				opts.artifact = args[0]
 			}
 
-			if opts.name != "" && opts.id != "" {
-				return errors.New(opts.localizer.MustLocalize("service.error.idAndNameCannotBeUsed"))
-			}
-
-			if opts.id != "" || opts.name != "" {
-				return runDescribe(opts)
+			if opts.registryID != "" {
+				return runGet(opts)
 			}
 
 			cfg, err := opts.Config.Load()
@@ -72,63 +69,67 @@ func NewGetCommand(f *factory.Factory) *cobra.Command {
 				return err
 			}
 
-			var registryConfig *config.ServiceRegistryConfig
-			if cfg.Services.ServiceRegistry == registryConfig || cfg.Services.ServiceRegistry.InstanceID == "" {
-				return errors.New(opts.localizer.MustLocalize("registry.common.error.noServiceSelected"))
+			if !cfg.HasServiceRegistry() {
+				return fmt.Errorf("No service Registry selected. Use 'rhoas service-registry use' to select your registry")
 			}
 
-			opts.id = cfg.Services.ServiceRegistry.InstanceID
-
-			return runDescribe(opts)
+			opts.registryID = fmt.Sprint(cfg.Services.ServiceRegistry.InstanceID)
+			return runGet(opts)
 		},
 	}
 
-	cmd.Flags().StringVarP(&opts.outputFormat, "output", "o", "json", opts.localizer.MustLocalize("registry.cmd.flag.output.description"))
-	cmd.Flags().StringVar(&opts.id, "id", "", opts.localizer.MustLocalize("registry.common.flag.id"))
+	cmd.Flags().StringVarP(&opts.artifact, "artifact", "a", "", "Id of the artifact")
+	cmd.Flags().StringVarP(&opts.group, "group", "g", "", "Id of the artifact")
+	cmd.Flags().StringVarP(&opts.registryID, "registryId", "", "", "Id of the registry to be used. By default uses currently selected registry.")
 
 	flagutil.EnableOutputFlagCompletion(cmd)
 
 	return cmd
 }
 
-func runDescribe(opts *Options) error {
-	connection, err := opts.Connection(connection.DefaultConfigSkipMasAuth)
+func runGet(opts *Options) error {
+	logger, err := opts.Logger()
 	if err != nil {
 		return err
 	}
 
-	api := connection.API()
+	conn, err := opts.Connection(connection.DefaultConfigRequireMasAuth)
+	if err != nil {
+		return err
+	}
 
-	var registry *srsmgmtv1.RegistryRest
+	dataAPI, _, err := conn.API().ServiceRegistryInstance(opts.registryID)
+	if err != nil {
+		return err
+	}
+
+	if opts.group == "" {
+		logger.Info("Group was not specified. Using 'default' artifacts group.")
+		opts.group = util.DefaultArtifactGroup
+	}
+
+	logger.Info("Fetching artifact")
+
+	if err != nil {
+		return nil
+	}
+
 	ctx := context.Background()
-	if opts.name != "" {
-		registry, _, err = serviceregistry.GetServiceRegistryByName(ctx, api.ServiceRegistryMgmt(), opts.name)
-		if err != nil {
-			return err
-		}
-	} else {
-		registry, _, err = serviceregistry.GetServiceRegistryByID(ctx, api.ServiceRegistryMgmt(), opts.id)
-		if err != nil {
-			return err
-		}
+	request := dataAPI.ArtifactsApi.GetLatestArtifact(ctx, opts.group, opts.artifact)
+	data, _, err := request.Execute()
+	if err != nil {
+		return registryinstanceerror.TransformError(err)
 	}
 
-	return printService(opts.IO.Out, registry, opts.outputFormat)
-}
+	fmt.Fprintf(os.Stdout, "%v\n", data)
 
-func printService(w io.Writer, registry interface{}, outputFormat string) error {
-	switch outputFormat {
-	case "yaml", "yml":
-		data, err := yaml.Marshal(registry)
-		if err != nil {
-			return err
-		}
-		return dump.YAML(w, data)
-	default:
-		data, err := json.Marshal(registry)
-		if err != nil {
-			return err
-		}
-		return dump.JSON(w, data)
-	}
+	// stringContent := new(strings.Builder)
+	// io.Copy(stringContent, data)
+	// if err != nil {
+	// 	return nil
+	// }
+	// io.WriteString(opts.IO.Out, stringContent.String())
+	logger.Info("Successfully downloaded artifact")
+
+	return nil
 }
